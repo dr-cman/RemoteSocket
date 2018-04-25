@@ -14,136 +14,198 @@
 //   - 4 buttons for manual switching added
 //   - update event generation for fhem  
 //
+// Version 1.1.0: changes in fhem command behaviour
+//   - uniform return format for /fhem commands
+//   - FhemName stored in EEPROM 
+//
 // http commands
-//   http://xxx.xxx.xxx.xxx<cmd>
+//   http://xxx.xxx.xxx.xxx/<cmd>
 //   <cmd>
 //   /          Homepage with status information
-//   /reset     restart RemoteSocket 
-//   /setup     configure RemoteSocket
+//
+//   /reset     restart RemoteSocket controller
+//
+//   /setup     configure RemoteSocket controller
 //              FhemIP=xxx.xxx.xxx.xxx  IP adress of Fhem server  (default 192.168.2.12)
 //              FhemPort=xxxx           Port number of Fhem server (default 8083)
 //              FhemMsg=[0|1]           Send update events to Fhem (default 1)
 //                                      0=no messages; 1=send messages
 //              FhemName=string         name of the device given in the fhem device define
-//              FhemVarIR               Fhem variable to be set with IR command data (default "d_IR")
-//              FhemVarTH               Fhem variable to be set with T/H values (default "d_Temp1")
+//              FhemTH                  Fhem variable to be set with T/H values (default "TH")
 //              DHTcycle                cycle time for T/H measurements in ms (default 60000)
-//   /fhem      do control from fhem (returns only a simple http page)
-//              sx=[on|off|toggle]      x=1..4  set socket state of socket n and returns state of all sockets  
-//              status                  returns the current socket state
-//              pair=name               sets the fhem device name that is used to send update events
-//              temperature             returns last measured temperature value
-//              humidity                returns last humidity value
+//
+//   /fhem      do requests from fhem   return value has the format: command=result
+//              command:                return value:
+//                                      function description:
+//              Sx=[on|off|toggle]      set socket state of socket n and returns state of all sockets  
+//              status                  return the current socket state
+//              device=name             set the fhem device name that is used to send update events
+//              TH                      return last measured temperature & humidity values
+//              getConfig               return the IP:port information used to communicate to fhem
+//
+//              Sx=[on|off|toggle]      status=0..15     new socket state (or "error")
+//                                      x=1..4 id of the selected socket
+//              status                  status=0..15     current socket status
+//              device=name             device=name
+//              TH                      TH=T: xx.x H: yy.y
+//              getConfig               xxx.xxx.xxx.xxx:yyyy
+//
 //   /msg       set relay states 
 //              status=x                x=0..15 (4 bit coding of all 4 relay states)
 //                                      Example: (bin) 1110 = (dec) 10 -> relay 4,3,2 off, relay 1 on
 //              or
 //              Sn=state                n=[1,2,3,4] state=[on, off, toggle]
+//
 //   /update    start OTY firmware update
+//
+//   Examples:
+//     http://xxx.xxx.xxx.xxx/
+//     http://xxx.xxx.xxx.xxx/setup?FhemIp=192.168.2.12 sets FhemIp variable to given IP
+//     http://xxx.xxx.xxx.xxx/fhem?status               requests current socket status
+//     http://xxx.xxx.xxx.xxx/fhem?temperature          requests current temperature value
+//     http://xxx.xxx.xxx.xxx/fhem?S1=on                sets status of socket 1 to on
+//                                                      (return status of all sockets)
+//     http://xxx.xxx.xxx.xxx/msg?status=3              set socket 1 & 2 to on state 
+//
 // Author C. Laloni
 // *******************************************************************************************
 
-// DHT22 support ---------------
+// include section
+// DHT22 support --------------------------------------------------------------------------
 #include <Adafruit_Sensor.h>
 #include <DHT.h>
 #include <DHT_U.h>
 
-// WiFi support ----------------
+// EEPROM support -------------------------------------------------------------------------
+#include <EEPROM.h>
+
+// WiFi support ---------------------------------------------------------------------------
 #include <ESP8266WiFi.h>
 #include <WiFiManager.h>                // https://github.com/tzapu/WiFiManager WiFi Configuration Magic
 #include <ESP8266mDNS.h>                // Useful to access to ESP by hostname.local
-//#include <PubSubClient.h>               // mqtt support
 
-// Web Server & Client ---------
+// Web Server & Client ---------------------------------------------------------------------
 #include <ESP8266WebServer.h>           // needed for web server
 #include <ESP8266HTTPClient.h>          // needed for client functions
 #include <ESP8266HTTPUpdateServer.h>    // needed for OTA updates
 
-// Ticker for LED blinking
+// Ticker for LED blinking -----------------------------------------------------------------
 #include <Ticker.h>
 
+// defines & global variables
 // System version
-String RemoteSocketVersion="1.0.0 " + String(__DATE__) + " " + String(__TIME__);
+String RemoteSocketVersion="1.1.0 " + String(__DATE__) + " " + String(__TIME__);
 
 int port = 80;
 char host_name[40] = "ESP8266RemoteSocket";
 char port_str[20] = "80";
-const char* mqtt_server = "192.168.2.17";
 
 ESP8266WebServer HTTPServer(port);
 ESP8266HTTPUpdateServer httpUpdater;
 
-// use define SERIAL_MONITOR to enable serial monitor (and disable channel 3 & 4)
+// use define SERIAL_MONITOR to enable serial monitor of Arduino IDE
+// in this case the program  uses only socket 1 & 2 because the
+// GPIOs used for socket 3 & 4 are needed for serial communication 
 #undef SERIAL_MONITOR
-
 #ifdef SERIAL_MONITOR
-#define CHANNELS 2
+#define CHANNELS 2      // only socket 1 & 2 are supported
 #else
-#define CHANNELS 4
+#define CHANNELS 4      // all 4 sockets are supported 
 #endif
 
+//
+#define EEPROMSize 32   // size of the EEPROM in bytes
+
 // configuration of GPIO pins
-#define Relay1 5    // GPIO5  = D1 
-#define Relay2 4    // GPIO4  = D2 
-#define Relay3 0    // GPIO0  = D3 
-#define Relay4 2    // GPIO2  = D4 
-#define Button1 12  // GPIO12 = D6
-#define Button2 13  // GPIO13 = D7
-#define Button3 1   // GPI01  = RX
-#define Button4 3   // GPIO3  = TX
-#define DHTpin 14   // GPIO15 = D5
-#define LEDpin 16   // GPIO16 = D0 (+ built-in LED)
+#define Relay1 5        // GPIO5  = D1 
+#define Relay2 4        // GPIO4  = D2 
+#define Relay3 0        // GPIO0  = D3 
+#define Relay4 2        // GPIO2  = D4 
+#define Button1 12      // GPIO12 = D6
+#define Button2 13      // GPIO13 = D7
+#define Button3 1       // GPI01  = RX
+#define Button4 3       // GPIO3  = TX
+#define DHTpin 14       // GPIO15 = D5
+#define LEDpin 16       // GPIO16 = D0 (same GPIO of built-in LED)
 
 static int Relay[4] = { Relay1, Relay2, Relay3, Relay4 };
-                      // stores the GPIO number for each of the 4 relais
-int RelayStatus[4];   // stores the status for each relais (HIGH (1)=off, LOW (0)=on)
-int SocketStatus;     // bitwise storage of status for all relais
-                      // Examples:
-                      // 0x0F = b0000111 = chan 1...4 off
-                      // 0x01 = b0000001 = cann 1 off, chan 2...4 on 
+                        // stores the GPIO number for each of the 4 relais
+int RelayStatus[4];     // stores the status for each relais (HIGH (1)=off, LOW (0)=on)
+int SocketStatus;       // bitwise storage of status for all relais
+                        // Examples:
+                        // 0x0F = b0000111 = chan 1...4 off
+                        // 0x01 = b0000001 = cann 1 off, chan 2...4 on 
 
 static int Button[4] = { Button1, Button2, Button3, Button4 };
-                      // stores the GPIO number for each of the 4 relais
-bool bBtnPressed[4];  // status flag for each button pressed=true
-long lBtnPressTime[4];// time when press was detected
+                        // stores the GPIO number for each of the 4 relais
+bool bBtnPressed[4];    // status flag for each button pressed=true
+long lBtnPressTime[4];  // time when press was detected
 
-// DHT related variables ------
+// DHT related variables -------------------------------------------------------------------
 DHT_Unified dht(DHTpin, DHT22);
-static float lastTemp=0;
-static float lastHum=0;
-static String sLastTemp="-";
-static String sLastHum="-";
+static float lastTemp=0;               //
+static float lastHum=0;                //
+static String sLastTemp="-";           //
+static String sLastHum="-";            //
 static unsigned long lastSent=0;
 uint32_t delayMS;
 
-// ticker to control blinking LED
+// ticker to control blinking LED ----------------------------------------------------------
 Ticker LEDticker;
 
 WiFiManager wifiManager;
 
-// Fhem settings -----------
-String FhemIP   = "192.168.2.17";                              // ip address of fhem system
-String FhemPort = "8083";                                      // port of fhem web server
-String FhemName  = "";                                         // name of fhem device used for event message
-String FhemVarRS = "d_RS";                                     // name of fhem dummy variable to set
-String FhemVarTH = "d_Temp3";                                  // name of fhem dummy variable to set for temp & humidity
-int FhemMsg = 1;                                               // send update events to fhem
-int DHTcycle = 60000;                                          // time between DHT measures in ms
-int STATUScycle = 600000;                                      // time between status messages in ms
-int MQTTcycle = 5000;                                          // time between MQTT reconnect attempts in ms
+// Fhem related settings -------------------------------------------------------------------
+String FhemIP   = "192.168.2.17";      // ip address of fhem system
+String FhemPort = "8083";              // port of fhem web server
+String FhemName  = "";                 // name of fhem device used for event message
+String FhemTH = "TH";                  // name of fhem reading to set for temp & humidity
+int FhemMsg = 1;                       // send update events to fhem
+int DHTcycle = 60000;                  // time between DHT measures in ms
+int STATUScycle = 600000;              // time between status messages in ms
 
-// OTA related settings -----
+// OTA related settings ---------------------------------------------------------------------
 const char* update_path = "/update";
 const char* update_username = "admin";
 const char* update_password = "cman";
 
 // ------------------------------------------------------------------------------------------
-// Status LED blinking
+// EEPROM_writeBytes() EEPROM_readBytes()
+// helper functions to write and read a byte block to the EEPROM at address 0
+// ------------------------------------------------------------------------------------------
+void EEPROM_writeFhemName(String name)
+{
+  int count=name.length();
+  EEPROM.write(0, (char)count);
+  for(int i=0; i<count && i<EEPROMSize-1; i++)
+    EEPROM.write(i+1, (name.c_str())[i]);
+  EEPROM.commit();
+  Serial.printf("[EEPRO] stored '%s'\n", name.c_str());
+}
+
+String EEPROM_readFhemName()
+{
+  String name="";
+  char c;
+  
+  int count=(int)(EEPROM.read(0));
+  for(int i=0; count>0 && i<count && i<EEPROMSize-1; i++) {
+    c=EEPROM.read(i+1);
+    name+=String(c);
+  }
+  Serial.printf("[EEPRO] read '%s'\n", name.c_str());
+
+  return name;
+}
+
+// ------------------------------------------------------------------------------------------
+// LEDblink() LEDoff()
+// helper functions to manage status LED blinking
 // ------------------------------------------------------------------------------------------
 void LEDblink()
 {
-  int state = digitalRead(LEDpin);        // get the current state
-  digitalWrite(LEDpin, !state);           // toggle state
+  int state = digitalRead(LEDpin);     // get the current state
+  digitalWrite(LEDpin, !state);        // toggle state
 }
 
 void LEDoff()
@@ -153,7 +215,8 @@ void LEDoff()
 }
 
 // ------------------------------------------------------------------------------------------
-// DHT initialization
+// DHTinit()
+// do the DHT sensor initialization
 // ------------------------------------------------------------------------------------------
 void DHTinit() {
   dht.begin();
@@ -185,7 +248,8 @@ void DHTinit() {
 }
 
 // ------------------------------------------------------------------------------------------
-// read DHT values
+// ReadDHT()
+// read DHT sensor values for temperature and humidity
 // ------------------------------------------------------------------------------------------
 bool ReadDHT(char *sTemp, char *sHum) {
   static unsigned long DHTlastReadout=0;
@@ -250,7 +314,8 @@ bool ReadDHT(char *sTemp, char *sHum) {
 }
 
 // ------------------------------------------------------------------------------------------
-// IP Address to String
+// ipToString()
+// helper function to convert an IP Address to a string
 // ------------------------------------------------------------------------------------------
 String ipToString(IPAddress ip)
 {
@@ -261,7 +326,8 @@ String ipToString(IPAddress ip)
 }
 
 // ------------------------------------------------------------------------------------------
-// handle msg
+// handle_msg()
+// helper function to handle 'msg' command
 // ------------------------------------------------------------------------------------------
 void handle_msg() {
   Serial.println("[HTTP ] Connection received: /msg");
@@ -302,44 +368,55 @@ void handle_msg() {
   }
 
   if (bSwitch) {
-    sendSwitchPage(); 
+    sendSwitchPage("", "", 0, 200); 
   } 
   else {
-    sendHomePage("Code Sent", "Success", 1); // 200
+    sendHomePage("Code Sent", "Success", 1, 200); 
   }  
 }
 
 // ------------------------------------------------------------------------------------------
-// handle fhem
+// handle_fhem()
+// helper function to handle 'fhem' command
 // ------------------------------------------------------------------------------------------
 void handle_fhem() {
-  bool bValid=false;
+  bool bValid=true;
   String retVal="???";
   
   Serial.println("[HTTP ] Connection received: /fhem");
-  
+
+  // parse arguments and execute commands
   if(HTTPServer.hasArg("status")) {
-    // request current socket states
+    // request current socket states -----
     int status = HTTPServer.arg("status").toInt();
-    retVal=String(SocketStatus);
-    bValid=true;
-  } else if(HTTPServer.hasArg("temperature")) {
-    // request temperature
-    retVal=sLastTemp;
-    bValid=true;
-  } else if(HTTPServer.hasArg("humidity")) {
-    // request humidity
-    retVal=sLastHum;
-    bValid=true;
-  } else if(HTTPServer.hasArg("pair")) {
-    // pair device
-    String Arg=HTTPServer.arg("pair");
+    retVal="status="+String(SocketStatus);
+  }
+  else if(HTTPServer.hasArg("TH")) {
+    // request temperature ---------------
+    int status = HTTPServer.arg("TH").toInt();
+    retVal="TH=T: "+sLastTemp+" H: "+sLastHum;
+  }
+  else if(HTTPServer.hasArg("getConfig")) {
+    // request device pairing -----------------
+    String Arg=HTTPServer.arg("getConfig");
+    retVal="getConfig="+FhemIP+":"+FhemPort;
+  }
+  else if(HTTPServer.hasArg("version")) {
+    // request device pairing -----------------
+    String Arg=HTTPServer.arg("version");
+    retVal="version="+RemoteSocketVersion;
+  }
+  else if(HTTPServer.hasArg("device")) {
+    // do device pairing -----------------
+    String Arg=HTTPServer.arg("device");
     FhemName=Arg;
-    retVal=FhemName;
-    bValid=true;
+    EEPROM_writeFhemName(FhemName);
+    retVal="device="+FhemName;
   }
   else {
+    // set new socket states -------------
     int NewStatus=SocketStatus;
+
     Serial.printf("[HTTP ] ");
     for(int i=0; i<CHANNELS; i++) {
       char sSocket[3];
@@ -349,32 +426,33 @@ void handle_fhem() {
         // set socket state
         String Arg=HTTPServer.arg(sSocket); 
         int stat=(SocketStatus>>i)&0x01;  // initialize with current status
-        bValid=true;
         
         if(Arg.equals("on"))          stat=0;         // set to on
         else if(Arg.equals("off"))    stat=1;         // set to off
         else if(Arg.equals("toggle")) stat=stat^0x01; // toggle
         else {
-          bValid=false;
+	        // something went wrong
+	        bValid=false;
           break;
         }
         
         Serial.printf("%s=%d(%s) ", sSocket, stat, Arg.c_str());
-
         if((SocketStatus&(0x01<<i))!=(stat<<i)) {
           NewStatus=NewStatus^(0x01<<i);
         }
       }
     }
     Serial.printf("\n");
+
     if(bValid) {
+      // no error occured
       SocketSet(NewStatus);
-      retVal=String(SocketStatus);
+      retVal="status="+String(SocketStatus);
     }
-    else
-      retVal="error";
+    else retVal="status=invalid argument";
   }
 
+  // send result back to calling fhem
   HTTPServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
   HTTPServer.send(200, "text/html; charset=utf-8", "");
   HTTPServer.sendContent(retVal);
@@ -382,7 +460,8 @@ void handle_fhem() {
 }
 
 // ------------------------------------------------------------------------------------------
-// handle setup
+// handle_setup()
+// helper function to handle HTTP 'setup' command
 // ------------------------------------------------------------------------------------------
 void handle_setup() {
   Serial.println("[HTTP ] Connection received: /setup");
@@ -390,19 +469,15 @@ void handle_setup() {
   FhemPort  = (HTTPServer.hasArg("FhemPort"))  ? HTTPServer.arg("FhemPort")         : FhemPort;
   FhemMsg   = (HTTPServer.hasArg("FhemMsg"))   ? HTTPServer.arg("FhemMsg").toInt()  : FhemMsg;
   FhemName  = (HTTPServer.hasArg("FhemName"))  ? HTTPServer.arg("FhemName")         : FhemName;
-  FhemVarRS = (HTTPServer.hasArg("FhemVarRS")) ? HTTPServer.arg("FhemVarRS")        : FhemVarRS;
-  FhemVarTH = (HTTPServer.hasArg("FhemVarTH")) ? HTTPServer.arg("FhemVarTH")        : FhemVarTH;
+  FhemTH    = (HTTPServer.hasArg("FhemTH"))    ? HTTPServer.arg("FhemTH")           : FhemTH;
   DHTcycle  = (HTTPServer.hasArg("DHTcycle"))  ? HTTPServer.arg("DHTcycle").toInt() : DHTcycle;
-  sendHomePage(); // 200
+  sendHomePage("", "", 0, 200); 
 }
 
 // ------------------------------------------------------------------------------------------
-// Send header HTML
+// sendHeader()
+// helper function to send a header HTML
 // ------------------------------------------------------------------------------------------
-void sendHeader() {
-  sendHeader(200);
-}
-
 void sendHeader(int httpcode) {
   HTTPServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
   HTTPServer.send(httpcode, "text/html; charset=utf-8", "");
@@ -430,7 +505,8 @@ void sendHeader(int httpcode) {
 }
 
 // ------------------------------------------------------------------------------------------
-// Send footer HTML
+// sendFooter()
+// helper function to send a footer HTML
 // ------------------------------------------------------------------------------------------
 void sendFooter() {
   HTTPServer.sendContent("      <div class='row'><div class='col-md-12'><em>" + String(millis()) + "ms uptime</em></div></div>\n");
@@ -442,20 +518,9 @@ void sendFooter() {
 }
 
 // ------------------------------------------------------------------------------------------
+// sendHomePage()
 // Stream home page HTML
 // ------------------------------------------------------------------------------------------
-void sendHomePage() {
-  sendHomePage("", "");
-}
-
-void sendHomePage(String message, String header) {
-  sendHomePage(message, header, 0);
-}
-
-void sendHomePage(String message, String header, int type) {
-  sendHomePage(message, header, type, 200);
-}
-
 void sendHomePage(String message, String header, int type, int httpcode) {
   bool received=false;
   bool sent=false;
@@ -466,17 +531,15 @@ void sendHomePage(String message, String header, int type, int httpcode) {
   if (type == 2)
     HTTPServer.sendContent("      <div class='row'><div class='col-md-12'><div class='alert alert-warning'><strong>" + header + "!</strong> " + message + "</div></div></div>\n");
   if (type == 3)
-    HTTPServer.sendContent("      <div class='row'><div class='col-md-12'><div class='alert alert-danger'><strong>" + header + "!</strong> " + message + "</div></div></div>\n");
+    HTTPServer.sendContent("      <div class='row'><div class='col-md-12'><div class='alert alert-danger'><strong>" + header + "!</strong> " + message + "</div></div></div>\n");  HTTPServer.sendContent("      <div class='row'>\n");
 
-  HTTPServer.sendContent("      <div class='row'>\n");
   HTTPServer.sendContent("        <div class='col-md-12'>\n");
   HTTPServer.sendContent("          <ul class='list-unstyled'>\n");
   for(int i=0; i<CHANNELS; i++) 
     HTTPServer.sendContent("            <li> Socket[" + String(i+1) + "]: <span class='badge'>" + String((RelayStatus[i]?"off":"on ")) + "</span> GPIO <span class='badge'>" + String(Relay[i]) + "</span></li>\n");
   HTTPServer.sendContent("            <li> FhemMsg <span class='badge'>" + String(FhemMsg) + "</span></li>\n");
   HTTPServer.sendContent("            <li> FhemIP:FhemPort <span class='badge'>" + String(FhemIP) + ":" + String(FhemPort) + "</span></li>\n");
-  HTTPServer.sendContent("            <li> FhemVarRS <span class='badge'>" + String(FhemVarRS) + "</span></li>\n");
-  HTTPServer.sendContent("            <li> FhemVarTH <span class='badge'>" + String(FhemVarTH) + "</span></li>\n");
+  HTTPServer.sendContent("            <li> FhemTH <span class='badge'>" + String(FhemTH) + "</span></li>\n");
   HTTPServer.sendContent("            <li> FhemName <span class='badge'>" + String(FhemName) + "</span></li>\n");
   HTTPServer.sendContent("            <li> DHTcycle <span class='badge'>" + String(DHTcycle) + "</span></li>\n");
   HTTPServer.sendContent("        </div>\n");
@@ -485,32 +548,20 @@ void sendHomePage(String message, String header, int type, int httpcode) {
 }
 
 // ------------------------------------------------------------------------------------------
-// Stream switch page HTML
+// sendSwitchPage()
+// Stream an HTML page that enables an interactive switching of the sockets
 // ------------------------------------------------------------------------------------------
-void sendSwitchPage() {
-  sendSwitchPage("", "");
-}
-
-void sendSwitchPage(String message, String header) {
-  sendSwitchPage(message, header, 0);
-}
-
-void sendSwitchPage(String message, String header, int type) {
-  sendSwitchPage(message, header, type, 200);
-}
-
 void sendSwitchPage(String message, String header, int type, int httpcode) {
   bool received=false;
   bool sent=false;
+  String sType;
   
-  //sendHeader(httpcode);
-  if (type == 1)
-    HTTPServer.sendContent("      <div class='row'><div class='col-md-12'><div class='alert alert-success'><strong>" + header + "!</strong> " + message + "</div></div></div>\n");
-  if (type == 2)
-    HTTPServer.sendContent("      <div class='row'><div class='col-md-12'><div class='alert alert-warning'><strong>" + header + "!</strong> " + message + "</div></div></div>\n");
-  if (type == 3)
-    HTTPServer.sendContent("      <div class='row'><div class='col-md-12'><div class='alert alert-danger'><strong>" + header + "!</strong> " + message + "</div></div></div>\n");
-
+  if(type==1)sType="success";
+  else if(type==2) sType="warning";
+  else sType="danger";
+  
+  sendHeader(httpcode);
+  HTTPServer.sendContent("      <div class='row'><div class='col-md-12'><div class='alert alert-" + sType + "'><strong>" + header + "!</strong> " + message + "</div></div></div>\n");  
   HTTPServer.sendContent("      <div class='row'>\n");
   HTTPServer.sendContent("        <div class='col-md-12'>\n");
   HTTPServer.sendContent("          <ul class='nav nav-pills'>\n");
@@ -521,12 +572,12 @@ void sendSwitchPage(String message, String header, int type, int httpcode) {
   HTTPServer.sendContent("          </ul>\n");
   HTTPServer.sendContent("        </div>\n");
   HTTPServer.sendContent("      </div><hr />\n");
-
-  //sendFooter();
+  sendFooter();
 }
 
 // ------------------------------------------------------------------------------------------
-// send HTTP command
+// SendHttpCmd()
+// send HTTP command back to a GET call
 // ------------------------------------------------------------------------------------------
 void SendHttpCmd(String httpCmd) {
   // configure traged server and url
@@ -546,6 +597,7 @@ void SendHttpCmd(String httpCmd) {
 }
 
 // ------------------------------------------------------------------------------------------
+// DHTtoFhem()
 // send temperature & humidity to a fhem web server
 // ------------------------------------------------------------------------------------------
 bool DHTtoFhem(char *sTemp, char *sHum) {
@@ -554,8 +606,8 @@ bool DHTtoFhem(char *sTemp, char *sHum) {
   digitalWrite(LEDpin, HIGH);         // switch on Status LED for one second
   LEDticker.attach(1, LEDoff);
 
-  httpCmd = "http://" + FhemIP + ":" + FhemPort + "/fhem?cmd.dummy=set%20" + FhemVarTH + "%20";
-  httpCmd += "T:%20" + String(sTemp) + "%20H:%20" + String(sHum) + "&XHR=1";
+  httpCmd = "http://" + FhemIP + ":" + FhemPort + "/fhem?cmd=setreading%20" + FhemName + "%20";
+  httpCmd += FhemTH + "%20T%3A%20" + String(sTemp) + "%20H%3A%20" + String(sHum) + "&XHR=1";
     
   Serial.printf("[HTTP ] DHTtoFhem: %s\n", httpCmd.c_str());
   SendHttpCmd(httpCmd);
@@ -564,6 +616,7 @@ bool DHTtoFhem(char *sTemp, char *sHum) {
 }
 
 // ------------------------------------------------------------------------------------------
+// UpdatetoFhem()
 // send update event to fhem device
 // ------------------------------------------------------------------------------------------
 bool UpdatetoFhem() {
@@ -588,6 +641,7 @@ bool UpdatetoFhem() {
 
 // ******************************************************************************************
 // setup()
+// do controller setup
 // ******************************************************************************************
 void setup() {
   Serial.begin(115200);
@@ -596,6 +650,12 @@ void setup() {
   Serial.printf("ESP8266 Remote Socket Controller (Version %s)\n", RemoteSocketVersion.c_str());
   delay(1000);
 
+  // EEPROM
+  EEPROM.begin(EEPROMSize);
+  String eeFhemName=EEPROM_readFhemName();
+  if(eeFhemName!="")
+    FhemName=eeFhemName;
+  
   // set LEDpin as output (LED)
   pinMode(LEDpin, OUTPUT);
   digitalWrite(LEDpin, LOW);
@@ -621,20 +681,20 @@ void setup() {
   HTTPServer.on("/status", []() {
     Serial.println("[HTTP ] Connection received: /status");
     //STATUSlastSent=0;
-    sendHomePage(); // 200
+    sendHomePage("", "", 0, 200); 
   });
   HTTPServer.on("/reset", []() {
     Serial.println("[HTTP ] Connection received: /reset");
-    sendHomePage(); // 200
+    sendHomePage("", "", 0, 200);
     ESP.reset();
   });
   HTTPServer.on("/switch", []() {
     Serial.println("[HTTP ] Connection received: /");
-    sendSwitchPage(); // 200
+    sendSwitchPage("", "", 0, 200); 
   });
   HTTPServer.on("/", []() {
     Serial.println("[HTTP ] Connection received: /");
-    sendHomePage(); // 200
+    sendHomePage("", "", 0, 200); 
   });
 
   MDNS.begin(host_name);
@@ -642,14 +702,14 @@ void setup() {
   // configure relais GPIOs and initial states
   SocketStatus=0;
 #ifndef SERIAL_MONITOR
-  pinMode(1, FUNCTION_3);
-  pinMode(3, FUNCTION_3);
+  pinMode(1, FUNCTION_3);                     // this disables serial communication to IDE!
+  pinMode(3, FUNCTION_3);                     // this disables serial communication to IDE!
 #endif
   for(int i=0; i<CHANNELS; i++) {
     RelayStatus[i]=HIGH;                      // set initial status to 'off' (=HIGH)
     pinMode(Relay[i], OUTPUT);                // set GPIO to output mode
     digitalWrite(Relay[i], RelayStatus[i]);   // set GPIO 
-    SocketStatus=SocketStatus|(HIGH<<i);       // store status of all 4 relais
+    SocketStatus=SocketStatus|(HIGH<<i);      // store status of all 4 relais
     pinMode(Button[i], INPUT_PULLUP);
     lBtnPressTime[i]=0L;
     bBtnPressed[i]=false;
@@ -710,25 +770,26 @@ void SocketSet(int StatusNew)
 }
 
 // ******************************************************************************************
-// main loop()
+// loop()
+// the controller main loop
 // ******************************************************************************************
 void loop() {
   int NewStatus;
   char sHum[10];
   char sTemp[10];
 
-  HTTPServer.handleClient();                                      // http server tasks
+  HTTPServer.handleClient();                                  // http server tasks
 
   // look for new values from DHT
   if(ReadDHT(sTemp, sHum)) {                                  // new values?
     DHTtoFhem(sTemp, sHum);                                   // send to Fhem Web Server
-    //HTSentToMQTT=false;
     sLastTemp=sTemp;
     sLastHum=sHum;
   }
 
   NewStatus=SocketStatus;
   for(int i=0; i<CHANNELS; i++) {
+    // read and store status of all buttons
     //Serial.printf("%d: %s %s\n", i+1, (bBtnPressed[i]?"true":"false"), (digitalRead(Button[i])?"on":"off"));
     if(!bBtnPressed[i] && !digitalRead(Button[i])) {
       // button i was not pressed but is now pressed
@@ -741,10 +802,11 @@ void loop() {
       bBtnPressed[i]=false;
       if(millis()-lBtnPressTime[i]>50) {
         NewStatus=SocketStatus^(0x01<<i); // toggle socket i
-        Serial.printf("Button[%d] released\n", i+1);
+        Serial.printf("Button[%d] released", i+1);
       }
     }
   }
+  
   if(NewStatus!=SocketStatus) {
     SocketSet(NewStatus);
     UpdatetoFhem();
