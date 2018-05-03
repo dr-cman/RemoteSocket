@@ -43,7 +43,7 @@
 //              TH                      return last measured temperature & humidity values
 //              getConfig               return the IP:port information used to communicate to fhem
 //
-//              Sx=[on|off|toggle]      status=0..15     new socket state (or "error")
+//              sx=[on|off|toggle]      status=0..15     new socket state (or "error")
 //                                      x=1..4 id of the selected socket
 //              status                  status=0..15     current socket status
 //              device=name             device=name
@@ -373,6 +373,10 @@ void handle_msg() {
   else {
     sendHomePage("Code Sent", "Success", 1, 200); 
   }  
+
+  // send an update event to fhem 
+  UpdatetoFhem();
+
 }
 
 // ------------------------------------------------------------------------------------------
@@ -380,8 +384,9 @@ void handle_msg() {
 // helper function to handle 'fhem' command
 // ------------------------------------------------------------------------------------------
 void handle_fhem() {
-  bool bValid=true;
+  bool bSocket=false;
   String retVal="???";
+  int NewStatus=SocketStatus;
   
   Serial.println("[HTTP ] Connection received: /fhem");
 
@@ -414,42 +419,34 @@ void handle_fhem() {
     retVal="device="+FhemName;
   }
   else {
+    // must be an sx=[on|off} command
     // set new socket states -------------
-    int NewStatus=SocketStatus;
-
+    
     Serial.printf("[HTTP ] ");
-    for(int i=0; i<CHANNELS; i++) {
+    for(int i=0; i<CHANNELS && !bSocket; i++) {
       char sSocket[3];
-      sprintf(sSocket, "S%d", i+1);
+      sprintf(sSocket, "s%d", i+1);
       
       if(HTTPServer.hasArg(sSocket)) {
         // set socket state
         String Arg=HTTPServer.arg(sSocket); 
         int stat=(SocketStatus>>i)&0x01;  // initialize with current status
+        bSocket=true;
         
         if(Arg.equals("on"))          stat=0;         // set to on
         else if(Arg.equals("off"))    stat=1;         // set to off
-        else if(Arg.equals("toggle")) stat=stat^0x01; // toggle
-        else {
-	        // something went wrong
-	        bValid=false;
-          break;
-        }
-        
+        else stat=stat^0x01;                          // toggle
+
         Serial.printf("%s=%d(%s) ", sSocket, stat, Arg.c_str());
         if((SocketStatus&(0x01<<i))!=(stat<<i)) {
-          NewStatus=NewStatus^(0x01<<i);
+          NewStatus=SocketStatus^(0x01<<i);
+          SocketSet(NewStatus);
         }
+        retVal="status="+String(SocketStatus);
+        //retVal=String(sSocket)+"="+Arg;
       }
     }
     Serial.printf("\n");
-
-    if(bValid) {
-      // no error occured
-      SocketSet(NewStatus);
-      retVal="status="+String(SocketStatus);
-    }
-    else retVal="status=invalid argument";
   }
 
   // send result back to calling fhem
@@ -457,6 +454,12 @@ void handle_fhem() {
   HTTPServer.send(200, "text/html; charset=utf-8", "");
   HTTPServer.sendContent(retVal);
   Serial.printf("[HTTP ] retVal=%s\n", retVal.c_str());
+
+  if(bSocket) {
+    // it was a socket command -> set desired usocket state
+    SocketSet(NewStatus);
+    UpdatetoFhem();
+  }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -554,14 +557,15 @@ void sendHomePage(String message, String header, int type, int httpcode) {
 void sendSwitchPage(String message, String header, int type, int httpcode) {
   bool received=false;
   bool sent=false;
-  String sType;
-  
-  if(type==1)sType="success";
-  else if(type==2) sType="warning";
-  else sType="danger";
   
   sendHeader(httpcode);
-  HTTPServer.sendContent("      <div class='row'><div class='col-md-12'><div class='alert alert-" + sType + "'><strong>" + header + "!</strong> " + message + "</div></div></div>\n");  
+  if (type == 1)
+    HTTPServer.sendContent("      <div class='row'><div class='col-md-12'><div class='alert alert-success'><strong>" + header + "!</strong> " + message + "</div></div></div>\n");
+  if (type == 2)
+    HTTPServer.sendContent("      <div class='row'><div class='col-md-12'><div class='alert alert-warning'><strong>" + header + "!</strong> " + message + "</div></div></div>\n");
+  if (type == 3)
+    HTTPServer.sendContent("      <div class='row'><div class='col-md-12'><div class='alert alert-danger'><strong>" + header + "!</strong> " + message + "</div></div></div>\n");  HTTPServer.sendContent("      <div class='row'>\n");
+
   HTTPServer.sendContent("      <div class='row'>\n");
   HTTPServer.sendContent("        <div class='col-md-12'>\n");
   HTTPServer.sendContent("          <ul class='nav nav-pills'>\n");
@@ -621,7 +625,7 @@ bool DHTtoFhem(char *sTemp, char *sHum) {
 // ------------------------------------------------------------------------------------------
 bool UpdatetoFhem() {
   String httpCmd;
-
+//return true;
   if(FhemName=="" || FhemMsg==0)
     // no FhemName set/not paired or no events 
     return true;
@@ -638,6 +642,25 @@ bool UpdatetoFhem() {
   return true;
 }
 
+bool UpdateFhemReading(String Reading, String Val) {
+  String httpCmd;
+
+return true;
+  if(FhemName=="" || FhemMsg==0)
+    // no FhemName set/not paired or no events 
+    return true;
+    
+  digitalWrite(LEDpin, HIGH);         // switch on Status LED for one second
+  LEDticker.attach(1, LEDoff);
+
+  httpCmd = "http://" + FhemIP + ":" + FhemPort + "/fhem?cmd=setreading%20" + FhemName + "%20";
+  httpCmd += Reading + "%20" + Val + "&XHR=1";
+    
+  Serial.printf("[HTTP ] UpdateFhemReading: %s\n", httpCmd.c_str());
+  SendHttpCmd(httpCmd);
+
+  return true;
+}
 
 // ******************************************************************************************
 // setup()
@@ -759,13 +782,19 @@ void SocketSet(int StatusNew)
       SocketStatus=SocketStatus^mask;
       RelayStatus[i]=(SocketStatus&mask?1:0);
       digitalWrite(Relay[i], RelayStatus[i]);
+
+      // update fhem reading
+      char sSocket[3];
+      sprintf(sSocket, "s%d", i+1);
+      UpdateFhemReading(String(sSocket), (RelayStatus[i]?"off":"on"));
     }
   }
 
   bStatus=char2binary((char)SocketStatus);
   Serial.printf("[Relay] ");
-  for(int i=0; i<CHANNELS; i++)
+  for(int i=0; i<CHANNELS; i++) {
     Serial.printf("%d=%s ", i+1, (RelayStatus[i]?"off":"on "));
+  }
   Serial.printf("\n");
 }
 
