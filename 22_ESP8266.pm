@@ -31,6 +31,7 @@ use strict;
 use warnings;
 use Data::Dumper;
 use HttpUtils;
+use SetExtensions;
 
 sub ESP8266_updateReadings($);
 sub ESP8266_execute($@);
@@ -60,7 +61,7 @@ ESP8266_Set($@)
   my $arg = "";
   my $err_log="";
 
-#  print "Set (parameter: @a)\n";
+  Log3 $hash->{NAME}, 5, "Set (parameter: @a)\n";
 
   if(int(@a)==2 && $a[1] eq "?") {
     return "Unknown argument $a[1], choose one of on off toggle status TH device getConfig" if(int(@a)==2 && $a[1] eq "?");
@@ -75,7 +76,7 @@ ESP8266_Set($@)
     elsif($cmd eq "device") {
       $arg=$hash->{NAME};
     }
-    else {
+    elsif($cmd eq "on" || $cmd eq "off" || $cmd eq "toggle") {
       if(int(@a) != 3) {
         return "no set value specified" if(int(@a) != 3);
       }
@@ -83,7 +84,7 @@ ESP8266_Set($@)
       $arg=$a[2]; 
       my $socket ="s".$arg;
 
-#      print("socket=$socket\n");
+      Log3 $hash->{NAME}, 5, "socket=$socket\n";
 
       if($cmd eq "toggle")
       {
@@ -100,12 +101,16 @@ ESP8266_Set($@)
         }
       }
     }
+    elsif(int(@a)>=3) {
+       print "$a[0] $a[1] $a[2]\n";
+       return SetExtensions($hash, "on:arg off:arg", $a[0], $a[1], $a[2]);
+    }
   }
 
-  Log GetLogLevel($a[0],2), "ESP8266 set @a";
+  Log3 $hash->{Name}, 2, "ESP8266 set @a";
   $err_log=ESP8266_execute($hash,$cmd,$arg);
   if($err_log ne "") {
-    Log GetLogLevel($a[0],2), "ESP8266 ".$err_log;
+    Log3 $hash->{Name}, 2, "ESP8266 ".$err_log;
   }
 
   return undef;
@@ -133,15 +138,12 @@ ESP8266_execute($@)
   my $URL='';
   my $log='';
 
-#  print("execute: $cmd $arg\n");
+  Log3 $hash->{NAME}, 5, "execute: $cmd $arg\n";
   for(my $i=1; $i<=4; $i++) {
     if($arg==$i) {
-#      print("channel $i\n");
-      if($cmd eq "on") {
-        $URL="http://".$hash->{DEF}."/fhem?S".$i."=on";
-      }
-      elsif($cmd eq "off") {
-        $URL="http://".$hash->{DEF}."/fhem?S".$i."=off";
+      Log3 $hash->{NAME}, 5, "channel $i\n";
+      if($cmd eq "on" || $cmd eq "off") {
+        $URL="http://".$hash->{DEF}."/fhem?s".$i."=".$cmd;
       }
     }
   }
@@ -156,7 +158,7 @@ ESP8266_execute($@)
     }
   }
 
-#  print "URL: $URL\n";
+  Log3 $hash->{NAME}, 5, "URL: $URL\n";
 
   my $param = {
     url       => $URL,
@@ -170,7 +172,6 @@ ESP8266_execute($@)
   HttpUtils_NonblockingGet($param); 
   return($log);
 }
-
 
 #-------------------------------------------------------------------------------
 sub
@@ -199,28 +200,22 @@ ESP8266_ParseHttpResponse($)
     my $cmd;
     my $val;
 
-#   print "HttpResponse: ";
-#   for(my $i=0; $i<$len; $i++) {
-#     print "$rVals[$i] ";
-#   }
-#   print "\n";
-
     if($len>=2) {
       $cmd=$rVals[0];
       $val=$rVals[1];
     }
 
     # Readings erzeugen/aktualisieren
-    # update last response reading
-    readingsSingleUpdate($hash, "lastResponse", $data, 1); 
+    # update lastResponse reading
+    readingsSingleUpdate($hash, "lastResponse", $data, 0); 
 
-    if($cmd eq "TH" || $cmd eq "device" || $cmd eq "getConfig") {
-      if($cmd eq "getConfig") {
-        $cmd="PairedTo";
-      }
+    if($cmd eq "TH" || $cmd eq "device" ) {
       readingsSingleUpdate($hash, $cmd, $val, 1); 
     }
-    else {
+    elsif($cmd eq "getConfig") {
+      readingsSingleUpdate($hash, "PairedTo", $val, 1); 
+    }
+    elsif($cmd eq "status") {
       ESP8266_setReadings($hash, $val);
     }
   }
@@ -233,7 +228,7 @@ ESP8266_updateReadings($)
 {
   my ($hash) = @_;
 
-#  print "updateReadings\n";
+  Log3 $hash->{NAME}, 5, "updateReadings\n";
   ESP8266_Set($hash, $hash->{NAME}, "status"); 
 
 #  print "Timer pollInterval=$hash->{INTERVAL}\n";
@@ -247,7 +242,7 @@ ESP8266_setReadings($@)
   my ($hash, $SocketState) = @_;
   my $state = "";
 
-# print "setReadings $SocketState\n";
+  Log3 $hash->{NAME}, 5, "setReadings $SocketState\n";
 
 
   if($SocketState eq "ERROR" || $SocketState eq "error") {
@@ -301,9 +296,11 @@ ESP8266_Attr(@) {
     return "Invalid value $attrVal for attribute $attrName: minimum value is 10 second, maximum 600 seconds"
   }
 
-  # set new pollInterval
-  $attr{$name}{pollInterval}=$attrVal;
-  $hash->{INTERVAL}=AttrVal($name, "pollInterval", 600);
+  if( $attrName eq "pollInterval" ) {
+    # set new pollInterval
+    $attr{$name}{pollInterval}=$attrVal;
+    $hash->{INTERVAL}=AttrVal($name, "pollInterval", 600);
+  }
 
   return undef;
 }
@@ -312,16 +309,16 @@ ESP8266_Attr(@) {
 sub 
 ESP8266_updateState($)
 {
-  my $hash = @_;
+  my ($hash) = @_;
   my $state = "";
 
   for(my $i=1; $i<=4; $i++) {
     my $socket="s".$i;
-    $state=$state.$socket.":".ReadingsVal($hash->{NAME},$socket,"???")." ";
+    $state=$state.$socket.": ".ReadingsVal($hash->{NAME},$socket,"???")." ";
   }
 
   # update STATE reading
-# print "updateState $state\n";
+  Log3 $hash->{NAME}, 5, "updateState $state\n";
   readingsSingleUpdate($hash, "STATE", $state, 1);
 }
 
@@ -340,14 +337,44 @@ ESP8266_Notify($$)
 
     # update readings after initialization or change of configuration
     Log3 $hash, 5, "ESP8266 $name: FHEM initialization or rereadcfg triggered update.";
+ 
+    RemoveInternalTimer($hash);
 
     # read configuration
     ESP8266_execute($hash, "getConfig", 0);
 
+    # initialize socket readings
+    readingsSingleUpdate($hash, "s1", "???", 0);
+    readingsSingleUpdate($hash, "s2", "???", 0);
+    readingsSingleUpdate($hash, "s3", "???", 0);
+    readingsSingleUpdate($hash, "s4", "???", 0);
+
     # do an initial update of socket readings
     InternalTimer(time()+2, "ESP8266_updateReadings", $hash, 0) ;
   }
+  else {
+    return undef;
+    # code reste des versuchs mit direkten setreading kommandos vom ESP zu arbeiten 
+    my $events = deviceEvents($dev,1);
+    return if( !$events );
 
+    foreach my $event (@{$events}) {
+      $event = "" if(!defined($event));
+
+      print "e: $event\n"; 
+      my @s=split(" ", $event);
+      print " len=".int(@s)."\n";
+      if(int(@s)==2) {
+        my $v=$s[0];
+        #print " $v";
+        if($v eq "s1:" || $v eq "s2:" || $v eq "s3:" || $v eq "s4:") {
+          # update STATE reading
+          ESP8266_updateState($hash);
+        }
+       #print "\n";
+      }
+    }
+  }
   return undef;
 }
 
