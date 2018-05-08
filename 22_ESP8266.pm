@@ -33,10 +33,11 @@ use Data::Dumper;
 use HttpUtils;
 use SetExtensions;
 
-sub ESP8266_updateReadings($);
-sub ESP8266_execute($@);
-sub ESP8266_setReadings($@);
-sub ESP8266_ParseHttpResponse($);
+#sub ESP8266_updateReadings($);
+#sub ESP8266_execute($@);
+#sub ESP8266_setReadings($@);
+#sub ESP8266_ParseHttpResponse($);
+
 
 #-------------------------------------------------------------------------------
 sub
@@ -48,8 +49,36 @@ ESP8266_Initialize($)
   $hash->{DefFn}     = "ESP8266_Define";
   $hash->{NotifyFn}  = "ESP8266_Notify";
   $hash->{AttrFn}    = "ESP8266_Attr";
+  $hash->{WriteFn}   = "ESP8266_Write";
   $hash->{AttrList}  = "loglevel:0,1,2,3,4,5,6 pollInterval:10,30,60,120,240,480,600";
 
+  $hash->{Clients}   = "ESP8266sw";
+  $hash->{MatchList} = { "1:ESP8266sw" => "^s[1-4]"};
+
+  # internal values
+  $hash->{Dev_s1}  = "";
+  $hash->{Dev_s2}  = "";
+  $hash->{Dev_s3}  = "";
+  $hash->{Dev_s4}  = "";
+}
+
+
+#-------------------------------------------------------------------------------
+sub
+ESP8266_Write($$)
+{
+  my ($hash, $message) = @_;
+  my @args = split(/ /, $message);
+
+  if(int(@args) >= 3) {
+    if($args[2] eq "register") {
+      return undef;
+    }
+  }
+
+  ESP8266_execute($hash, $args[0], $args[1]);
+
+  return undef;
 }
 
 #-------------------------------------------------------------------------------
@@ -61,73 +90,24 @@ ESP8266_Set($@)
   my $arg = "";
   my $err_log="";
 
-  Log3 $hash->{NAME}, 5, "Set (parameter: @a)\n";
 
   if(int(@a)==2 && $a[1] eq "?") {
-    return "Unknown argument $a[1], choose one of on off toggle status TH device getConfig" if(int(@a)==2 && $a[1] eq "?");
+    return "Unknown argument $a[1], choose one of status getConfig TH" if(int(@a)==2 && $a[1] eq "?");
   }
 
+  # print "ESP8266_Set(@a)\n";
   if(int(@a)>=2) {
     $cmd=$a[1];
 
-    if($cmd eq "status" || $cmd eq "TH" || $cmd eq "getConfig") {
+    if($cmd eq "status" || $cmd eq "getConfig" || $cmd eq "TH") {
       $arg=0;
-    }
-    elsif($cmd eq "device") {
-      $arg=$hash->{NAME};
-    }
-    elsif($cmd eq "on" || $cmd eq "off" || $cmd eq "toggle") {
-      if(int(@a) != 3) {
-        return "no set value specified" if(int(@a) != 3);
-      }
-
-      $arg=$a[2]; 
-      my $socket ="s".$arg;
-
-      Log3 $hash->{NAME}, 5, "socket=$socket\n";
-
-      if($cmd eq "toggle")
-      {
-        if(defined $hash->{READINGS}{$socket}{VAL}) {
-          if($hash->{READINGS}{$socket}{VAL} eq "off") {
-   	    $cmd="on";
-          }
-          else {
-       	    $cmd="off";
-          }
-        }
-        else {
-          $cmd="off";
-        }
-      }
-    }
-    elsif(int(@a)>=3) {
-       print "$a[0] $a[1] $a[2]\n";
-       return SetExtensions($hash, "on:arg off:arg", $a[0], $a[1], $a[2]);
     }
   }
 
   Log3 $hash->{Name}, 2, "ESP8266 set @a";
-  $err_log=ESP8266_execute($hash,$cmd,$arg);
-  if($err_log ne "") {
-    Log3 $hash->{Name}, 2, "ESP8266 ".$err_log;
-  }
+  ESP8266_execute($hash, $cmd, $arg);
 
   return undef;
-}
-
-#-------------------------------------------------------------------------------
-sub 
-ESP8266_GetUpdate($)
-{
-  my ($hash) = @_;
-  my $name = $hash->{NAME};
-  Log3 $name, 4, "ESP8266 GetUpdate called";
-	
-  ESP8266_updateReadings($hash);
-	
-  # neuen Timer starten in einem konfigurierten Interval.
-  InternalTimer(gettimeofday()+30, "ESP8266_GetUpdate", $hash);
 }
 
 #-------------------------------------------------------------------------------
@@ -135,29 +115,9 @@ sub
 ESP8266_execute($@)
 {
   my ($hash,$cmd,$arg) = @_;
-  my $URL='';
-  my $log='';
+  my $URL="http://".$hash->{DEF}."/fhem?".$cmd."=".$arg;
 
-  Log3 $hash->{NAME}, 5, "execute: $cmd $arg\n";
-  for(my $i=1; $i<=4; $i++) {
-    if($arg==$i) {
-      Log3 $hash->{NAME}, 5, "channel $i\n";
-      if($cmd eq "on" || $cmd eq "off") {
-        $URL="http://".$hash->{DEF}."/fhem?s".$i."=".$cmd;
-      }
-    }
-  }
-
-  if($URL eq '') {
-    # nothing matched so far
-    if($cmd eq "status" || $cmd eq "TH" || $cmd eq "device" || $cmd eq "getConfig") {
-      $URL="http://".$hash->{DEF}."/fhem?".$cmd."=".$arg;
-    }
-    else {
-      return($log);
-    }
-  }
-
+  # print "ESP8266_execute($cmd $arg)\n";
   Log3 $hash->{NAME}, 5, "URL: $URL\n";
 
   my $param = {
@@ -170,7 +130,7 @@ ESP8266_execute($@)
   };
 
   HttpUtils_NonblockingGet($param); 
-  return($log);
+  return undef;
 }
 
 #-------------------------------------------------------------------------------
@@ -192,7 +152,9 @@ ESP8266_ParseHttpResponse($)
   elsif($data ne "") {
     # Abfrage erfolgreich ($data enthält Ergebnisdaten)
     # Eintrag fürs Log
-    Log3 $name, 3, "url ".$param->{url}." returned: $data";
+    # print "url ".$param->{url}." returned: $data\n";
+
+    return undef if($data eq "unknown command");
 
     # parsen von $data
     my @rVals = split("=", $data);
@@ -209,11 +171,35 @@ ESP8266_ParseHttpResponse($)
     # update lastResponse reading
     readingsSingleUpdate($hash, "lastResponse", $data, 0); 
 
-    if($cmd eq "TH" || $cmd eq "device" ) {
+    if($cmd eq "TH") {
       readingsSingleUpdate($hash, $cmd, $val, 1); 
     }
     elsif($cmd eq "getConfig") {
-      readingsSingleUpdate($hash, "PairedTo", $val, 1); 
+      my @args = split(/ /, $val);
+
+      # print Dumper \@args;
+      if(int(@args)>=4) {
+        my $type=$args[0];
+        readingsSingleUpdate($hash, "type", $type, 1); 
+        readingsSingleUpdate($hash, "MACaddress", $args[1], 1); 
+        readingsSingleUpdate($hash, "IP", $args[2], 1); 
+        readingsSingleUpdate($hash, "Port", $args[3], 1); 
+        readingsSingleUpdate($hash, "Device", $args[4], 1); 
+        readingsSingleUpdate($hash, "Firmware", $args[5], 1); 
+
+        if($type eq "RemoteSocket") {
+          # create logic devices
+          for(my $i=6; $i<int(@args); $i++) {
+            $cmd=$args[$i];
+
+            if($cmd eq "s1" || $cmd eq "s2" || $cmd eq "s3" || $cmd eq "s4") {
+              # print "Dispatch($hash->{NAME} $cmd)\n";
+              Dispatch($hash, $cmd, undef);
+            }
+          }
+        }
+      }
+      return undef;
     }
     elsif($cmd eq "status") {
       ESP8266_setReadings($hash, $val);
@@ -231,7 +217,7 @@ ESP8266_updateReadings($)
   Log3 $hash->{NAME}, 5, "updateReadings\n";
   ESP8266_Set($hash, $hash->{NAME}, "status"); 
 
-#  print "Timer pollInterval=$hash->{INTERVAL}\n";
+  # print "Timer pollInterval=$hash->{INTERVAL}\n";
   InternalTimer(gettimeofday()+$hash->{INTERVAL}, "ESP8266_updateReadings", $hash); 
 }
 
@@ -259,12 +245,17 @@ ESP8266_setReadings($@)
 
   for(my $i=0; $i<4; $i++) {
     my $socket = "s".($i+1);
+    my $devname=$hash->{"channel_".$socket};
+    my $dev=$modules{ESP8266sw}{defptr}{$devname};
+    # print "devname=$devname\n";
 
     if($SocketState&(1<<$i))
     {
       if(defined $hash->{READINGS}{$socket}{VAL}) {
         if($hash->{READINGS}{$socket}{VAL} ne "off") {
           readingsSingleUpdate($hash, $socket, "off", 1);
+          readingsSingleUpdate($dev,"STATE","off", 1);
+          fhem("setstate $devname off");
         }
       }
       $state=$state.$socket.": off ";
@@ -274,6 +265,8 @@ ESP8266_setReadings($@)
       if(defined $hash->{READINGS}{$socket}{VAL}) {
         if($hash->{READINGS}{$socket}{VAL} ne "on") {
           readingsSingleUpdate($hash, $socket, "on", 1);
+          readingsSingleUpdate($dev,"STATE","on", 1);
+          fhem("setstate $devname on");
         }
       }
       $state=$state.$socket.": on ";
@@ -312,6 +305,7 @@ ESP8266_updateState($)
   my ($hash) = @_;
   my $state = "";
 
+  # create STATE as a compilation of individual states sx x=1..4
   for(my $i=1; $i<=4; $i++) {
     my $socket="s".$i;
     $state=$state.$socket.": ".ReadingsVal($hash->{NAME},$socket,"???")." ";
@@ -388,8 +382,13 @@ ESP8266_Define($$)
 
   return "Wrong syntax: use define <name> ESP8266 <ip-address>" if(int(@a) != 3);
 
+  # print "ESP8266 Define: $def\n";
+  # initialize STATE
+  $hash->{STATE}="defined";
   # set default pollInterval
   $hash->{INTERVAL}=AttrVal($name, "pollInterval", 600);
+
+  $modules{ESP8266}{defptr}{$name} = $hash;
 
   return undef;
 }
