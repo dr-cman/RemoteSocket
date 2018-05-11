@@ -18,6 +18,12 @@
 //   - uniform return format for /fhem commands
 //   - FhemName stored in EEPROM 
 //
+// Version 1.2.0: configuration stored to EEPROM
+//   - permanent storage of configuration to EEPROM
+//   - function to reset EEPROM 
+//
+// Version 1.3.0: 
+//
 // http commands
 //   http://xxx.xxx.xxx.xxx/<cmd>
 //   <cmd>
@@ -35,21 +41,17 @@
 //              DHTcycle                cycle time for T/H measurements in ms (default 60000)
 //
 //   /fhem      do requests from fhem   return value has the format: command=result
-//              command:                return value:
-//                                      function description:
+//              command:                function description:
+//                                      return value:
 //              Sx=[on|off|toggle]      set socket state of socket n and returns state of all sockets  
+//                                      status=x   x=0..15
 //              status                  return the current socket state
+//                                      status=x   x=0..15
 //              device=name             set the fhem device name that is used to send update events
 //              TH                      return last measured temperature & humidity values
-//              getConfig               return the IP:port information used to communicate to fhem
-//
-//              sx=[on|off|toggle]      status=0..15     new socket state (or "error")
-//                                      x=1..4 id of the selected socket
-//              status                  status=0..15     current socket status
-//              device=name             device=name
-//              TH                      TH=T: xx.x H: yy.y
-//              getConfig               xxx.xxx.xxx.xxx:yyyy
-//
+//                                      TH=T: xx.x H: yy.y
+//              getConfig               return the entire configuration information used to communicate to fhem
+//                                      gtConfig=RemoteSocket <MAC> <IP> <Port> <Device> <FirmwareVersion>
 //   /msg       set relay states 
 //              status=x                x=0..15 (4 bit coding of all 4 relay states)
 //                                      Example: (bin) 1110 = (dec) 10 -> relay 4,3,2 off, relay 1 on
@@ -62,7 +64,7 @@
 //     http://xxx.xxx.xxx.xxx/
 //     http://xxx.xxx.xxx.xxx/setup?FhemIp=192.168.2.12 sets FhemIp variable to given IP
 //     http://xxx.xxx.xxx.xxx/fhem?status               requests current socket status
-//     http://xxx.xxx.xxx.xxx/fhem?temperature          requests current temperature value
+//     http://xxx.xxx.xxx.xxx/fhem?TH=0                 requests current temperature value
 //     http://xxx.xxx.xxx.xxx/fhem?S1=on                sets status of socket 1 to on
 //                                                      (return status of all sockets)
 //     http://xxx.xxx.xxx.xxx/msg?status=3              set socket 1 & 2 to on state 
@@ -94,10 +96,10 @@
 
 // defines & global variables
 // System version
-String RemoteSocketVersion="1.1.0 " + String(__DATE__) + " " + String(__TIME__);
+String RemoteSocketVersion="1.3.0 " + String(__DATE__) + " " + String(__TIME__);
 
 int port = 80;
-char host_name[40] = "ESP8266RemoteSocket";
+char host_name[40] = "ESP8266RemoteSocket1";
 char port_str[20] = "80";
 
 ESP8266WebServer HTTPServer(port);
@@ -113,8 +115,22 @@ ESP8266HTTPUpdateServer httpUpdater;
 #define CHANNELS 4      // all 4 sockets are supported 
 #endif
 
-//
-#define EEPROMSize 32   // size of the EEPROM in bytes
+// EEProm related defines and definitions
+#define EEPROMSize    256  // max. total size of the EEPROM in bytes
+#define CFGIP         16    // IP address:  'xxx.xxx.xxx.xxx'
+#define CFGPort       5   // port:        '8083'
+#define CFGDevice     32  // device name: max 32 character
+#define CFGMAC        18  // MAC adress:  'xx.xx.xx.xx.xx.xx'
+
+typedef struct t_CFG {
+  char MAC[CFGMAC];
+  char IP[CFGIP];
+  char Port[CFGPort];
+  char Device[CFGDevice];
+  int  FhemMsg;
+  int  DHTcycle;
+  int  STATUScycle;
+} CFG;
 
 // configuration of GPIO pins
 #define Relay1 5        // GPIO5  = D1 
@@ -156,10 +172,11 @@ Ticker LEDticker;
 WiFiManager wifiManager;
 
 // Fhem related settings -------------------------------------------------------------------
-String FhemIP   = "192.168.2.17";      // ip address of fhem system
+String FhemIP   = "192.168.2.12";      // ip address of fhem system
 String FhemPort = "8083";              // port of fhem web server
 String FhemName  = "";                 // name of fhem device used for event message
 String FhemTH = "TH";                  // name of fhem reading to set for temp & humidity
+String MAC = "";
 int FhemMsg = 1;                       // send update events to fhem
 int DHTcycle = 60000;                  // time between DHT measures in ms
 int STATUScycle = 600000;              // time between status messages in ms
@@ -170,32 +187,77 @@ const char* update_username = "admin";
 const char* update_password = "cman";
 
 // ------------------------------------------------------------------------------------------
-// EEPROM_writeBytes() EEPROM_readBytes()
-// helper functions to write and read a byte block to the EEPROM at address 0
+// EEPROM_writeCFG() EEPROM_readCFG() EEPROM_clear()
+// helper functions to
+// - write CFG data to EEPROM
+// - read CFG data to EEPROM
+// - clear all EEPROM data (factory reset)
 // ------------------------------------------------------------------------------------------
-void EEPROM_writeFhemName(String name)
+void EEPROM_writeCFG()
 {
-  int count=name.length();
-  EEPROM.write(0, (char)count);
-  for(int i=0; i<count && i<EEPROMSize-1; i++)
-    EEPROM.write(i+1, (name.c_str())[i]);
+  CFG cfg;
+  String tmp=WiFi.macAddress();
+
+  // copy all configuration values to CFG structure
+  sprintf(cfg.MAC, "%s", tmp.c_str());
+  FhemIP.toCharArray(cfg.IP, CFGIP);
+  FhemPort.toCharArray(cfg.Port, CFGPort);
+  FhemName.toCharArray(cfg.Device, CFGDevice);
+  cfg.FhemMsg=FhemMsg;
+  cfg.DHTcycle=DHTcycle;
+  cfg.STATUScycle=STATUScycle;
+
+  // write to EEPROM
+  EEPROM.put(0, cfg);  
   EEPROM.commit();
-  Serial.printf("[EEPRO] stored '%s'\n", name.c_str());
+
+  Serial.printf("[EEPRO] cfg stored %s %s:%s %s FhemMsg=%d DHTcycle=%d STATUScycle=%d\n",
+                cfg.MAC, cfg.IP, cfg.Port, cfg.Device, cfg.FhemMsg, DHTcycle, STATUScycle);
 }
 
-String EEPROM_readFhemName()
+void EEPROM_readCFG()
 {
-  String name="";
-  char c;
-  
-  int count=(int)(EEPROM.read(0));
-  for(int i=0; count>0 && i<count && i<EEPROMSize-1; i++) {
-    c=EEPROM.read(i+1);
-    name+=String(c);
-  }
-  Serial.printf("[EEPRO] read '%s'\n", name.c_str());
+  CFG cfg;
 
-  return name;
+  // read from EEPROM
+  EEPROM.get(0, cfg);  
+  MAC=cfg.MAC;
+
+  if(MAC!=String(WiFi.macAddress())) {
+    // EEPROM contains no valid data (not yet initialized)
+    // use default values
+    MAC=WiFi.macAddress();
+    FhemIP="xxx.xxx.xxx.xxx";
+    FhemPort="8083";
+    FhemName="undefined";
+    FhemMsg=1;
+    DHTcycle=60000;
+    STATUScycle=600000;
+  }
+  else {
+    // copy all configuration values from CFG structure to global variables
+    MAC=cfg.MAC;
+    FhemIP=cfg.IP;
+    FhemPort=cfg.Port;
+    FhemName=cfg.Device;
+    FhemMsg=cfg.FhemMsg;
+    DHTcycle=cfg.DHTcycle;
+    STATUScycle=cfg.STATUScycle;
+  }
+
+  Serial.printf("[EEPRO] restored cfg %s %s:%s %s FhemMsg=%d DHTcycle=%d STATUScycle=%d\n",
+                MAC.c_str(), FhemIP.c_str(), FhemPort.c_str(), FhemName.c_str(),
+                FhemMsg, DHTcycle, STATUScycle);
+}
+
+void EEPROM_clear()
+{
+  // clear entire EEPROM
+  for(int addr=0; addr<EEPROMSize; addr++)
+    EEPROM.write(addr,0);  
+  EEPROM.commit();
+  
+  Serial.printf("[EEPRO] cleared\n");
 }
 
 // ------------------------------------------------------------------------------------------
@@ -390,8 +452,38 @@ void handle_fhem() {
   
   Serial.println("[HTTP ] Connection received: /fhem");
 
-  // parse arguments and execute commands
-  if(HTTPServer.hasArg("status")) {
+  // parse arguments and execute corresponding commands
+  if(HTTPServer.hasArg("pair") && HTTPServer.hasArg("ip") &&
+     HTTPServer.hasArg("port") && HTTPServer.hasArg("device")) {
+    // do a device pairing  -----------------
+    FhemIP=HTTPServer.arg("ip");
+    FhemPort=HTTPServer.arg("port");
+    FhemName=HTTPServer.arg("device");
+    // store to EEPROM
+    EEPROM_writeCFG();
+
+    // return the MAC address of the paired HW-device
+    retVal="pair="+String(WiFi.macAddress());
+  }
+  else if(HTTPServer.hasArg("factoryreset")) {
+    // reset all EEPROM data -----
+    String Arg=HTTPServer.arg("factoryreset");
+    EEPROM_clear();
+    retVal="factoryreset=done";
+  }
+  else if(HTTPServer.hasArg("getConfig")) {
+    // request HW-device configuration -----------------
+    String Arg=HTTPServer.arg("getConfig");
+    String tmp=RemoteSocketVersion;
+
+    for(int i=0; i<tmp.length(); i++)
+      if(tmp[i]==' ') tmp[i]='_';
+
+    // return configuration info in the form
+    // <mac> <ip>:<port> <name> <firmware version>
+    retVal="getConfig=RemoteSocket "+MAC+" "+FhemIP+" "+FhemPort+" "+FhemName+" "+tmp+" s1 s2 s3 s4 TH";
+  }
+  else if(HTTPServer.hasArg("status")) {
     // request current socket states -----
     int status = HTTPServer.arg("status").toInt();
     retVal="status="+String(SocketStatus);
@@ -401,27 +493,11 @@ void handle_fhem() {
     int status = HTTPServer.arg("TH").toInt();
     retVal="TH=T: "+sLastTemp+" H: "+sLastHum;
   }
-  else if(HTTPServer.hasArg("getConfig")) {
-    // request device pairing -----------------
-    String Arg=HTTPServer.arg("getConfig");
-    retVal="getConfig="+FhemIP+":"+FhemPort;
-  }
-  else if(HTTPServer.hasArg("version")) {
-    // request device pairing -----------------
-    String Arg=HTTPServer.arg("version");
-    retVal="version="+RemoteSocketVersion;
-  }
-  else if(HTTPServer.hasArg("device")) {
-    // do device pairing -----------------
-    String Arg=HTTPServer.arg("device");
-    FhemName=Arg;
-    EEPROM_writeFhemName(FhemName);
-    retVal="device="+FhemName;
-  }
-  else {
-    // must be an sx=[on|off} command
+  else if(HTTPServer.hasArg("s1") || HTTPServer.hasArg("s2") ||
+          HTTPServer.hasArg("s3") || HTTPServer.hasArg("s4")) {
+    // it is a swith command with the format sx=[on|off|toggle] witth x=[1-4]
     // set new socket states -------------
-    
+
     Serial.printf("[HTTP ] ");
     for(int i=0; i<CHANNELS && !bSocket; i++) {
       char sSocket[3];
@@ -437,16 +513,24 @@ void handle_fhem() {
         else if(Arg.equals("off"))    stat=1;         // set to off
         else stat=stat^0x01;                          // toggle
 
-        Serial.printf("%s=%d(%s) ", sSocket, stat, Arg.c_str());
+        Serial.printf("[HTTP ] %s=%d (%s)\n", sSocket, stat, Arg.c_str());
         if((SocketStatus&(0x01<<i))!=(stat<<i)) {
           NewStatus=SocketStatus^(0x01<<i);
           SocketSet(NewStatus);
         }
         retVal="status="+String(SocketStatus);
-        //retVal=String(sSocket)+"="+Arg;
       }
     }
-    Serial.printf("\n");
+  }
+  else {
+    // unknown command received
+    retVal="unknown command";
+  }
+
+  if(bSocket) {
+    // it was a socket command -> set desired socket state
+    SocketSet(NewStatus);
+    // UpdatetoFhem();
   }
 
   // send result back to calling fhem
@@ -454,12 +538,6 @@ void handle_fhem() {
   HTTPServer.send(200, "text/html; charset=utf-8", "");
   HTTPServer.sendContent(retVal);
   Serial.printf("[HTTP ] retVal=%s\n", retVal.c_str());
-
-  if(bSocket) {
-    // it was a socket command -> set desired usocket state
-    SocketSet(NewStatus);
-    UpdatetoFhem();
-  }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -474,6 +552,9 @@ void handle_setup() {
   FhemName  = (HTTPServer.hasArg("FhemName"))  ? HTTPServer.arg("FhemName")         : FhemName;
   FhemTH    = (HTTPServer.hasArg("FhemTH"))    ? HTTPServer.arg("FhemTH")           : FhemTH;
   DHTcycle  = (HTTPServer.hasArg("DHTcycle"))  ? HTTPServer.arg("DHTcycle").toInt() : DHTcycle;
+
+  EEPROM_writeCFG();
+  
   sendHomePage("", "", 0, 200); 
 }
 
@@ -625,7 +706,7 @@ bool DHTtoFhem(char *sTemp, char *sHum) {
 // ------------------------------------------------------------------------------------------
 bool UpdatetoFhem() {
   String httpCmd;
-//return true;
+
   if(FhemName=="" || FhemMsg==0)
     // no FhemName set/not paired or no events 
     return true;
@@ -673,11 +754,9 @@ void setup() {
   Serial.printf("ESP8266 Remote Socket Controller (Version %s)\n", RemoteSocketVersion.c_str());
   delay(1000);
 
-  // EEPROM
+  // EEPROM prepare and read configuration
   EEPROM.begin(EEPROMSize);
-  String eeFhemName=EEPROM_readFhemName();
-  if(eeFhemName!="")
-    FhemName=eeFhemName;
+  EEPROM_readCFG();
   
   // set LEDpin as output (LED)
   pinMode(LEDpin, OUTPUT);
