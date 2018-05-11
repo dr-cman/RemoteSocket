@@ -50,7 +50,7 @@ ESP8266_Initialize($)
   $hash->{NotifyFn}  = "ESP8266_Notify";
   $hash->{AttrFn}    = "ESP8266_Attr";
   $hash->{WriteFn}   = "ESP8266_Write";
-  $hash->{AttrList}  = "loglevel:0,1,2,3,4,5,6 pollInterval:10,30,60,120,240,480,600";
+  $hash->{AttrList}  = "pollInterval:10,30,60,120,240,480,600";
 
   $hash->{Clients}   = "ESP8266sw";
   $hash->{MatchList} = { "1:ESP8266sw" => "^s[1-4]"};
@@ -70,12 +70,6 @@ ESP8266_Write($$)
   my ($hash, $message) = @_;
   my @args = split(/ /, $message);
 
-  if(int(@args) >= 3) {
-    if($args[2] eq "register") {
-      return undef;
-    }
-  }
-
   ESP8266_execute($hash, $args[0], $args[1]);
 
   return undef;
@@ -86,25 +80,35 @@ sub
 ESP8266_Set($@)
 {
   my ($hash, @a) = @_;
+  my $name = $hash->{NAME};
   my $cmd = "";
   my $arg = "";
   my $err_log="";
 
 
   if(int(@a)==2 && $a[1] eq "?") {
-    return "Unknown argument $a[1], choose one of status getConfig TH" if(int(@a)==2 && $a[1] eq "?");
+    return "Unknown argument $a[1], choose one of pair status getConfig TH" if(int(@a)==2 && $a[1] eq "?");
   }
 
-  # print "ESP8266_Set(@a)\n";
+  Log3 $name, 4, "$name Set(@a)";
   if(int(@a)>=2) {
     $cmd=$a[1];
 
     if($cmd eq "status" || $cmd eq "getConfig" || $cmd eq "TH") {
       $arg=0;
     }
+    elsif($cmd eq "pair") {
+      my $ip=qx(hostname -I);
+      $ip=substr($ip, 0, length($ip)-1); # delete \n
+      $ip=~s/\s//;;                      # delete spaces
+
+      # compile the command argument
+      $arg="0&ip=$ip&port=8083&device=$hash->{NAME}";
+      Log3 $name, 5, "pair arg=$arg";
+    }
   }
 
-  Log3 $hash->{Name}, 2, "ESP8266 set @a";
+  Log3 $name, 2, "$name Set() set @a";
   ESP8266_execute($hash, $cmd, $arg);
 
   return undef;
@@ -115,10 +119,11 @@ sub
 ESP8266_execute($@)
 {
   my ($hash,$cmd,$arg) = @_;
+  my $name = $hash->{NAME};
   my $URL="http://".$hash->{DEF}."/fhem?".$cmd."=".$arg;
 
-  # print "ESP8266_execute($cmd $arg)\n";
-  Log3 $hash->{NAME}, 5, "URL: $URL\n";
+  Log3 $name, 4, "$name execute($cmd $arg)";
+  Log3 $name, 5, "URL: $URL";
 
   my $param = {
     url       => $URL,
@@ -141,10 +146,12 @@ ESP8266_ParseHttpResponse($)
   my $hash = $param->{hash};
   my $name = $hash->{NAME};
 
+  Log3 $name, 4, "$name ParsteHttpResponse($data $err)";
+
   if($err ne "") {
     # Fehler bei der HTTP Abfrage aufgetreten
     # Eintrag fürs Log
-    Log3 $name, 3, "error while requesting ".$param->{url}." - $err";
+    Log3 $name, 1, "error while requesting ".$param->{url}." - $err";
 
     # Readings erzeugen
     ESP8266_setReadings($hash, "ERROR");
@@ -152,7 +159,7 @@ ESP8266_ParseHttpResponse($)
   elsif($data ne "") {
     # Abfrage erfolgreich ($data enthält Ergebnisdaten)
     # Eintrag fürs Log
-    # print "url ".$param->{url}." returned: $data\n";
+    Log3 $name, 5, "url ".$param->{url}." returned: $data";
 
     return undef if($data eq "unknown command");
 
@@ -169,10 +176,14 @@ ESP8266_ParseHttpResponse($)
 
     # Readings erzeugen/aktualisieren
     # update lastResponse reading
-    readingsSingleUpdate($hash, "lastResponse", $data, 0); 
+    readingsSingleUpdate($hash, "lastResponse", $data, 1); 
 
     if($cmd eq "TH") {
       readingsSingleUpdate($hash, $cmd, $val, 1); 
+    }
+    elsif($cmd eq "pair") {
+      readingsSingleUpdate($hash, "PairedTo", $val, 1); 
+      fhem("setstate $name paired");
     }
     elsif($cmd eq "getConfig") {
       my @args = split(/ /, $val);
@@ -181,7 +192,7 @@ ESP8266_ParseHttpResponse($)
       if(int(@args)>=4) {
         my $type=$args[0];
         readingsSingleUpdate($hash, "type", $type, 1); 
-        readingsSingleUpdate($hash, "MACaddress", $args[1], 1); 
+        readingsSingleUpdate($hash, "PairedTo", $args[1], 1); 
         readingsSingleUpdate($hash, "IP", $args[2], 1); 
         readingsSingleUpdate($hash, "Port", $args[3], 1); 
         readingsSingleUpdate($hash, "Device", $args[4], 1); 
@@ -193,8 +204,9 @@ ESP8266_ParseHttpResponse($)
             $cmd=$args[$i];
 
             if($cmd eq "s1" || $cmd eq "s2" || $cmd eq "s3" || $cmd eq "s4") {
-              # print "Dispatch($hash->{NAME} $cmd)\n";
+              Log3 $name, 5, "call Dispatch($name $cmd)";
               Dispatch($hash, $cmd, undef);
+              readingsSingleUpdate($hash, $cmd, "???", 1); 
             }
           }
         }
@@ -213,11 +225,16 @@ sub
 ESP8266_updateReadings($)
 {
   my ($hash) = @_;
+  my $name = $hash->{NAME};
 
-  Log3 $hash->{NAME}, 5, "updateReadings\n";
-  ESP8266_Set($hash, $hash->{NAME}, "status"); 
+  Log3 $name, 4, "$name updateReadings()";
 
-  # print "Timer pollInterval=$hash->{INTERVAL}\n";
+  if(ReadingsVal($name, "PairedTo", "none") ne "none") {
+    # update status if device is already paired
+    ESP8266_Set($hash, $name, "status"); 
+  }
+
+  Log3 $name, 5, "timer pollInterval=$hash->{INTERVAL}";
   InternalTimer(gettimeofday()+$hash->{INTERVAL}, "ESP8266_updateReadings", $hash); 
 }
 
@@ -226,10 +243,10 @@ sub
 ESP8266_setReadings($@)
 {
   my ($hash, $SocketState) = @_;
+  my $name = $hash->{NAME};
   my $state = "";
 
-  Log3 $hash->{NAME}, 5, "setReadings $SocketState\n";
-
+  Log3 $name, 4, "$name setReadings($SocketState)";
 
   if($SocketState eq "ERROR" || $SocketState eq "error") {
     # error occured -> set all readings to unknown
@@ -238,8 +255,8 @@ ESP8266_setReadings($@)
 
       readingsSingleUpdate($hash, $socket, "???", 1);
     }
-    $state="???";
-    readingsSingleUpdate($hash, "STATE", $state, 1);
+    readingsSingleUpdate($hash, "STATE", "connection_error", 1);
+    fhem("setstate $hash->{NAME} connection_error");
     return;
   }
 
@@ -247,7 +264,7 @@ ESP8266_setReadings($@)
     my $socket = "s".($i+1);
     my $devname=$hash->{"channel_".$socket};
     my $dev=$modules{ESP8266sw}{defptr}{$devname};
-    # print "devname=$devname\n";
+    Log3 $name, 5, "devname=$devname";
 
     if($SocketState&(1<<$i))
     {
@@ -275,6 +292,7 @@ ESP8266_setReadings($@)
 
   # update STATE reading
   readingsSingleUpdate($hash, "STATE", $state, 1);
+  fhem("setstate $hash->{NAME} $state");
 }
 
 #-------------------------------------------------------------------------------
@@ -283,7 +301,7 @@ ESP8266_Attr(@) {
   my ( $cmd, $name, $attrName, $attrVal ) = @_;
   my $hash = $defs{$name};
 
-  Log3 $name, 5, "ESP8266 $name: function ESP8266_Attr() called";
+  Log3 $name, 4, "$name Attr($attrName, $attrVal)";
 
   if ( $attrVal && $attrName eq "pollInterval" && ( $attrVal < 10 || $attrVal > 600 ) ) {
     return "Invalid value $attrVal for attribute $attrName: minimum value is 10 second, maximum 600 seconds"
@@ -303,16 +321,17 @@ sub
 ESP8266_updateState($)
 {
   my ($hash) = @_;
+  my $name = $hash->{NAME};
   my $state = "";
 
   # create STATE as a compilation of individual states sx x=1..4
   for(my $i=1; $i<=4; $i++) {
     my $socket="s".$i;
-    $state=$state.$socket.": ".ReadingsVal($hash->{NAME},$socket,"???")." ";
+    $state=$state.$socket.": ".ReadingsVal($name,$socket,"???")." ";
   }
 
   # update STATE reading
-  Log3 $hash->{NAME}, 5, "updateState $state\n";
+  Log3 $name, 4, "$name updateState($state)";
   readingsSingleUpdate($hash, "STATE", $state, 1);
 }
 
@@ -330,45 +349,14 @@ ESP8266_Notify($$)
     return if($attr{$name} && $attr{$name}{disable});
 
     # update readings after initialization or change of configuration
-    Log3 $hash, 5, "ESP8266 $name: FHEM initialization or rereadcfg triggered update.";
+    Log3 $hash, 5, "$name Notify: FHEM initialization or rereadcfg triggered update.";
  
     RemoveInternalTimer($hash);
-
-    # read configuration
-    ESP8266_execute($hash, "getConfig", 0);
-
-    # initialize socket readings
-    readingsSingleUpdate($hash, "s1", "???", 0);
-    readingsSingleUpdate($hash, "s2", "???", 0);
-    readingsSingleUpdate($hash, "s3", "???", 0);
-    readingsSingleUpdate($hash, "s4", "???", 0);
 
     # do an initial update of socket readings
     InternalTimer(time()+2, "ESP8266_updateReadings", $hash, 0) ;
   }
-  else {
-    return undef;
-    # code reste des versuchs mit direkten setreading kommandos vom ESP zu arbeiten 
-    my $events = deviceEvents($dev,1);
-    return if( !$events );
 
-    foreach my $event (@{$events}) {
-      $event = "" if(!defined($event));
-
-      print "e: $event\n"; 
-      my @s=split(" ", $event);
-      print " len=".int(@s)."\n";
-      if(int(@s)==2) {
-        my $v=$s[0];
-        #print " $v";
-        if($v eq "s1:" || $v eq "s2:" || $v eq "s3:" || $v eq "s4:") {
-          # update STATE reading
-          ESP8266_updateState($hash);
-        }
-       #print "\n";
-      }
-    }
-  }
   return undef;
 }
 
@@ -377,18 +365,19 @@ sub
 ESP8266_Define($$)
 {
   my ($hash, $def) = @_;
-  my @a = split("[ \t][ \t]*", $def);
   my $name=$hash->{NAME};
+  my @a = split("[ \t][ \t]*", $def);
 
   return "Wrong syntax: use define <name> ESP8266 <ip-address>" if(int(@a) != 3);
 
-  # print "ESP8266 Define: $def\n";
+  Log3 $name, 4, "ESP8266 Define: $def";
   # initialize STATE
   $hash->{STATE}="defined";
   # set default pollInterval
   $hash->{INTERVAL}=AttrVal($name, "pollInterval", 600);
 
   $modules{ESP8266}{defptr}{$name} = $hash;
+  readingsSingleUpdate($hash, "PairedTo", "none", 1); 
 
   return undef;
 }
@@ -410,11 +399,11 @@ ESP8266_Define($$)
   <ul>
     <code>define &lt;name&gt; ESP8266 &lt;ip-address&gt; </code>
     <br><br>
-    Defines an ESP8266 device (remote switchable socket) via its ip address<br><br>
+    Defines an ESP8266 io-device (remote switchable socket) via its ip address<br><br>
 
     Examples:
     <ul>
-      <code>define socket ESP8266 192.168.1.200</code><br>
+      <code>define myESP ESP8266 192.168.1.200</code><br>
     </ul>
   </ul>
   <br>
@@ -426,20 +415,20 @@ ESP8266_Define($$)
     <br><br>
     where <code>value</code> is one of:<br>
     <pre>
-    off n          n=1,2,3,4 
-    on n           n=1,2,3,4
-    toggle         n=1,2,3,4
+    pair
+    getConfig
     status
+    TH
     </pre>
     Examples:
     <ul>
-      <code>set socket on 1</code><br>
-      <code>set socket toggle 2</code><br>
+      <code>set myESP pair</code><br>
+      <code>set myESP getConfig</code><br>
     </ul>
     <br>
     Notes:
     <ul>
-      <li>Toggle is special implemented. List name returns "on" or "off" even after a toggle command</li>
+      <li>The ESP8266 device defined by 'name' establishes the connection to an ESP8266 IoT hardware. The functions of the ESP8266 hardware device are controlled by logical devices. After the initial definition, the device 'name' must be paired with the ESP8266 IoT devide using the command 'set name pair'. On success the Reading PairedTo contains the MAC adderess of the paired ESP8266 hardware device. If the device has been successfully paired the logical devices can be defined/created. This can be done manually or simply by calling 'getConfig' if autocreate is enabled.</li>
     </ul>
   </ul>
 </ul>

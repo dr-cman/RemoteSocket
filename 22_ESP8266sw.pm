@@ -47,30 +47,31 @@ ESP8266sw_Initialize($)
   $hash->{NotifyFn}  = "ESP8266sw_Notify";
 
   $hash->{Match} = "^s[1-4]"
-  # $hash->{AttrList}  = "loglevel:0,1,2,3,4,5,6 pollInterval:10,30,60,120,240,480,600";
-
 }
 
 #-------------------------------------------------------------------------------
 sub
 ESP8266sw_Set($@)
 {
-  my ($hash, @a) = @_;
-  my $cmd = "";
-  my $arg = "";
-  my $err_log="";
+  my ($hash, $name, $cmd, @args) = @_;
+  my $cmdList = "on off";
 
-  # print "Set (parameter: @a)\n";
+  Log3 $name, 4, "$name Set($name $cmd @args)";
 
-  if(int(@a)==2 && $a[1] eq "?") {
-    return "Unknown argument $a[1], choose one of on off" if(int(@a)==2 && $a[1] eq "?");
+  if($cmd eq "?") {
+    return "Unknown argument $cmd, choose one of on off" if($cmd eq "?");
   }
 
-  # print "ESP8266sw_Set(@a)\n";
+  Log3 $name, 5, "$name Set($cmd @args)";
 
-  my $arguments = "$hash->{channel} $a[1]";
-  IOWrite($hash, $arguments);
-  readingsSingleUpdate($hash, "STATE", $a[1], 1);
+  my $arguments = "$hash->{channel} $cmd";
+  if($cmd eq "on" || $cmd eq "off") {
+    IOWrite($hash, $arguments);
+    readingsSingleUpdate($hash, "STATE", $cmd, 1);
+  }
+  else {
+    return SetExtensions($hash, $cmdList, $name, $cmd, @args);
+  }
   return undef;
 }
 
@@ -88,14 +89,12 @@ ESP8266sw_Notify($$)
     return if($attr{$name} && $attr{$name}{disable});
 
     # update readings after initialization or change of configuration
-    Log3 $hash, 5, "ESP8266sw $name: FHEM initialization or rereadcfg triggered update.";
+    Log3 $name, 5, "$name Notify: FHEM initialization or rereadcfg triggered update.";
  
-    RemoveInternalTimer($hash);
+    # RemoveInternalTimer($hash);
 
-    # do an initial update of socket readings
-    # InternalTimer(time()+2, "ESP8266sw_updateReadings", $hash, 0) ;
-    my $arguments = "$hash->{DEF} register $hash->{NAME}";
-    IOWrite($hash, $arguments);
+    readingsSingleUpdate($hash, "STATE", "initialized", 1);
+    fhem("setstate $hash->{NAME} initialized");
   }
 
   return undef;
@@ -106,22 +105,23 @@ sub
 ESP8266sw_Parse($$)
 {
   my ($io_hash, $message) = @_;
+  my $name=$io_hash->{NAME};
   my @a=split(/ /, $message);
   my $address=$a[0]; 
 
-  # print "ESP8266sw_Parse($message)  io_hash: $io_hash->{NAME}, address: $address\n"; 
+  Log3 $name, 4, "$name Parse($message)  io_hash: $name, address: $address"; 
 
   # print Dumper($message);
   if(my $hash=$modules{ESP8266sw}{defptr}{$io_hash->{NAME}."_".$address}) {
     # Nachricht für $hash verarbeiten
     # Rückgabe des Gerätenamens, für welches die Nachricht bestimmt ist.
-    # print "ESP8266sw_Parse() return: $hash->{NAME}\n";
+    Log3 $hash->{NAME}, 5, "$hash->{NAME} Parse() return: $hash->{NAME}";
     return $hash->{NAME}; 
   }
   else {
     # Keine Gerätedefinition verfügbar
-    # Daher Vorschlag define-Befehl: <NAME> <MODULNAME> <ADDRESSE> <IO Dev>
-    # print "ESP8266sw_Parse() return: undefined\n";
+    # Daher Vorschlag define-Befehl: <NAME> <MODULNAME> <IO Dev> <ADDRESSE>
+    Log3 $io_hash->{NAME}, 5, "$io_hash->{NAME} Parse() return: undefined";
     return "UNDEFINED $io_hash->{NAME}_$address ESP8266sw $io_hash->{NAME} $address";
   }
 }
@@ -132,7 +132,6 @@ ESP8266sw_Undef($$)
 {
   my ( $hash, $name) = @_;       
   DevIo_CloseDev($hash);         
-  RemoveInternalTimer($hash);    
   return undef;                  
 }
 
@@ -141,13 +140,13 @@ sub
 ESP8266sw_Define($$)
 {
   my ($hash, $def) = @_;
-  my @a = split("[ \t][ \t]*", $def);
   my $name=$hash->{NAME};
+  my @a = split("[ \t][ \t]*", $def);
 
   return "Wrong syntax: use define <name> ESP8266sw <device> <socket>" if(int(@a) != 4);
 
   my $address = $a[0];
-  # print "ESP8622sw_Define($def) address: $address\n"; 
+  Log3 $name, 4, "$name Define($def) address: $address"; 
 
   $modules{ESP8266sw}{defptr}{$address} = $hash;
 
@@ -172,21 +171,21 @@ ESP8266sw_Define($$)
 =pod
 =begin html
 
-<a name="ESP8266"></a>
-<h3>ESP8266</h3>
+<a name="ESP8266sw"></a>
+<h3>ESP8266sw</h3>
 <ul>
   Note: this module needs the HTTP::Request and LWP::UserAgent perl modules.
   <br><br>
-  <a name="ESP8266define"></a>
+  <a name="ESP8266swdefine"></a>
   <b>Define</b>
   <ul>
-    <code>define &lt;name&gt; ESP8266 &lt;ip-address&gt; </code>
+    <code>define &lt;name&gt; ESP8266sw &lt;io_device&gt; &lt;address&gt; </code>
     <br><br>
-    Defines an ESP8266 device (remote switchable socket) via its ip address<br><br>
+    Defines a logical ESP8266sw device (remote switchable socket) via its ESP io-device<br><br>
 
     Examples:
     <ul>
-      <code>define socket ESP8266 192.168.1.200</code><br>
+      <code>define ESP_s1 ESP8266sw ESP s1</code><br>
     </ul>
   </ul>
   <br>
@@ -198,23 +197,24 @@ ESP8266sw_Define($$)
     <br><br>
     where <code>value</code> is one of:<br>
     <pre>
-    off n          n=1,2,3,4 
-    on n           n=1,2,3,4
-    toggle         n=1,2,3,4
-    status
+    off 
+    on 
+    on-for-timer
+    off-for-timer
+    toggle
     </pre>
     Examples:
     <ul>
-      <code>set socket on 1</code><br>
-      <code>set socket toggle 2</code><br>
+      <code>set ESP_s1 on</code><br>
+      <code>set ESP_s1 off</code><br>
+      <code>set ESP_s1 on-for-timer 60</code><br>
     </ul>
     <br>
     Notes:
     <ul>
-      <li>Toggle is special implemented. List name returns "on" or "off" even after a toggle command</li>
+      <li>Only 'on' and 'off' are direct device commandes. All other commands, e.g. on-for-timer, are implemented with the fhem SetExtensions() function.</li>
     </ul>
   </ul>
 </ul>
-
 =end html
 =cut
